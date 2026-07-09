@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import json
 import io
@@ -22,6 +23,21 @@ logger = logging.getLogger("FamilyFinance")
 load_dotenv()
 
 app = FastAPI(title="FamilyFinance AI & NLP Service")
+
+# ---------------------------------------------------------
+# CONFIGURE CORS
+# ---------------------------------------------------------
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",")]
+
+# Allow the React frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins, 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize the DeepSeek API client asynchronously
 client = AsyncOpenAI(
