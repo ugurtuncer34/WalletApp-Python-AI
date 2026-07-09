@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Security, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 import os
 import json
 import io
@@ -22,7 +23,29 @@ logger = logging.getLogger("FamilyFinance")
 # Load environment variables securely from .env
 load_dotenv()
 
-app = FastAPI(title="FamilyFinance AI & NLP Service")
+# ---------------------------------------------------------
+# SECURITY & ENVIRONMENT
+# ---------------------------------------------------------
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+NLP_API_SECRET = os.getenv("NLP_API_SECRET", "development_fallback_secret")
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key != NLP_API_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API Key"
+        )
+    return api_key
+
+# Disable Swagger and OpenAPI JSON completely in production
+app = FastAPI(
+    title="FamilyFinance AI & NLP Service",
+    docs_url=None if ENVIRONMENT == "production" else "/docs",
+    redoc_url=None if ENVIRONMENT == "production" else "/redoc",
+    openapi_url=None if ENVIRONMENT == "production" else "/openapi.json"
+)
 
 # ---------------------------------------------------------
 # CONFIGURE CORS
@@ -36,7 +59,7 @@ app.add_middleware(
     allow_origins=allowed_origins, 
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"], # X-API-KEY
 )
 
 # Initialize the DeepSeek API client asynchronously
@@ -82,7 +105,8 @@ async def process_pdf_page_async(page_text: str, page_num: int, system_prompt: s
 async def parse_statement(
     file: UploadFile = File(...),
     categories: str = Form(None),
-    merchants: str = Form(None)
+    merchants: str = Form(None),
+    api_key: str = Depends(verify_api_key) # Security check added
 ):
     try:
         logger.info("==================================================")
