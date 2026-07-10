@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Security, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from starlette.middleware.base import BaseHTTPMiddleware
 import os
 import json
 import io
@@ -8,17 +9,32 @@ import pdfplumber
 import logging
 import time
 import asyncio
+import contextvars
+import uuid
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 # ---------------------------------------------------------
-# CONFIGURE LOGGING
+# CONFIGURE LOGGING & CORRELATION ID
 # ---------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# Async-safe / Thread-safe variable
+correlation_id_var = contextvars.ContextVar("correlation_id", default="unknown")
+
+class CorrelationIdFilter(logging.Filter):
+    def filter(self, record):
+        record.correlation_id = correlation_id_var.get()
+        return True
+    
 logger = logging.getLogger("FamilyFinance")
+logger.setLevel(logging.INFO)
+logger.handlers.clear() # Clear existing handlers
+
+handler = logging.StreamHandler()
+# %(correlation_id)s added to format
+formatter = logging.Formatter("%(asctime)s - [%(correlation_id)s] - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+handler.addFilter(CorrelationIdFilter())
+logger.addHandler(handler)
 
 # Load environment variables securely from .env
 load_dotenv()
@@ -46,6 +62,20 @@ app = FastAPI(
     redoc_url=None if ENVIRONMENT == "production" else "/redoc",
     openapi_url=None if ENVIRONMENT == "production" else "/openapi.json"
 )
+
+# Correlation Middleware
+class CorrelationIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        # cacth from .NET, if not, generate new
+        corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+        correlation_id_var.set(corr_id)
+        
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = corr_id
+        return response
+
+# Apply middleware to FastAPI
+app.add_middleware(CorrelationIdMiddleware)
 
 # ---------------------------------------------------------
 # CONFIGURE CORS
