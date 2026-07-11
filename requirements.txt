@@ -4,3 +4,7 @@ pdfplumber
 openai
 python-dotenv
 python-multipart
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp

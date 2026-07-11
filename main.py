@@ -14,10 +14,17 @@ import uuid
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+# OPENTELEMETRY IMPORTS
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
 # ---------------------------------------------------------
 # CONFIGURE LOGGING & CORRELATION ID
 # ---------------------------------------------------------
-# Async-safe / Thread-safe variable
 correlation_id_var = contextvars.ContextVar("correlation_id", default="unknown")
 
 class CorrelationIdFilter(logging.Filter):
@@ -27,16 +34,14 @@ class CorrelationIdFilter(logging.Filter):
     
 logger = logging.getLogger("FamilyFinance")
 logger.setLevel(logging.INFO)
-logger.handlers.clear() # Clear existing handlers
+logger.handlers.clear()
 
 handler = logging.StreamHandler()
-# %(correlation_id)s added to format
 formatter = logging.Formatter("%(asctime)s - [%(correlation_id)s] - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 handler.addFilter(CorrelationIdFilter())
 logger.addHandler(handler)
 
-# Load environment variables securely from .env
 load_dotenv()
 
 # ---------------------------------------------------------
@@ -55,7 +60,6 @@ async def verify_api_key(api_key: str = Security(api_key_header)):
         )
     return api_key
 
-# Disable Swagger and OpenAPI JSON completely in production
 app = FastAPI(
     title="FamilyFinance AI & NLP Service",
     docs_url=None if ENVIRONMENT == "production" else "/docs",
@@ -66,7 +70,6 @@ app = FastAPI(
 # Correlation Middleware
 class CorrelationIdMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        # cacth from .NET, if not, generate new
         corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
         correlation_id_var.set(corr_id)
         
@@ -74,25 +77,36 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
         response.headers["X-Correlation-ID"] = corr_id
         return response
 
-# Apply middleware to FastAPI
 app.add_middleware(CorrelationIdMiddleware)
 
-# ---------------------------------------------------------
-# CONFIGURE CORS
-# ---------------------------------------------------------
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
 allowed_origins = [origin.strip() for origin in allowed_origins_env.split(",")]
 
-# Allow the React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins, 
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"], # X-API-KEY
+    allow_headers=["*"],
 )
 
-# Initialize the DeepSeek API client asynchronously
+# ---------------------------------------------------------
+# OPENTELEMETRY TRACING
+# ---------------------------------------------------------
+otlp_endpoint = os.getenv("OTLP_ENDPOINT", "http://localhost:4317")
+
+resource = Resource.create({"service.name": "FamilyFinance.NLP"})
+provider = TracerProvider(resource=resource)
+processor = BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint, insecure=True))
+provider.add_span_processor(processor)
+trace.set_tracer_provider(provider)
+
+# Instrument the app AFTER middlewares are added
+FastAPIInstrumentor.instrument_app(app)
+
+# ---------------------------------------------------------
+# APP LOGIC
+# ---------------------------------------------------------
 client = AsyncOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com",
@@ -105,7 +119,6 @@ async def health_check():
     return {"status": "active", "service": "FamilyFinance NLP Core"}
 
 async def process_pdf_page_async(page_text: str, page_num: int, system_prompt: str):
-    """Sends a single PDF page to DeepSeek API for extraction."""
     logger.info(f"Page {page_num}: Sending to DeepSeek...")
     start_time = time.time()
     
@@ -136,19 +149,15 @@ async def parse_statement(
     file: UploadFile = File(...),
     categories: str = Form(None),
     merchants: str = Form(None),
-    api_key: str = Depends(verify_api_key) # Security check added
+    api_key: str = Depends(verify_api_key)
 ):
     try:
         logger.info("==================================================")
         logger.info(f"NEW REQUEST: Parsing statement -> {file.filename}")
         
-        # ---------------------------------------------------------
-        # 1. PARSE INCOMING MAPPINGS (WITH ROBUST FALLBACKS)
-        # ---------------------------------------------------------
         parsed_categories = []
         parsed_merchants = []
         
-        # Fallback logic for categories: Try JSON, if fail, split by comma
         if categories:
             try:
                 parsed_categories = json.loads(categories)
@@ -157,7 +166,6 @@ async def parse_statement(
                 logger.info("Categories: Fell back to comma-separated parsing.")
             logger.info(f"Loaded {len(parsed_categories)} categories.")
 
-        # Fallback logic for merchants
         if merchants:
             try:
                 parsed_merchants = json.loads(merchants)
@@ -165,9 +173,6 @@ async def parse_statement(
                 logger.warning("Merchants: Failed to parse JSON. Complex fallback not possible, ignoring.")
             logger.info(f"Loaded {len(parsed_merchants)} merchants.")
 
-        # ---------------------------------------------------------
-        # 2. EXTRACT TEXT BY PAGE (CHUNKING)
-        # ---------------------------------------------------------
         logger.info("STEP 1: Extracting text using pdfplumber...")
         pages_text = []
         
@@ -183,9 +188,6 @@ async def parse_statement(
         if not pages_text:
             return {"success": False, "message": "Could not extract text. PDF might be empty."}
 
-        # ---------------------------------------------------------
-        # 3. BUILD THE SYSTEM PROMPT
-        # ---------------------------------------------------------
         system_prompt = f"""
         You are a highly precise financial data extraction API. 
         You will receive the raw text of ONE PAGE from a Turkish credit card statement.
@@ -226,34 +228,25 @@ async def parse_statement(
         }}
         """
         
-        # ---------------------------------------------------------
-        # 4. PARALLEL AI PROCESSING (ASYNC GATHER)
-        # ---------------------------------------------------------
         logger.info(f"STEP 2: Dispatching {len(pages_text)} concurrent API requests...")
         api_start_time = time.time()
         
-        # Create asynchronous tasks for all pages simultaneously
         tasks = [
             process_pdf_page_async(text, i + 1, system_prompt) 
             for i, text in enumerate(pages_text)
         ]
         
-        # Execute all tasks in parallel
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         logger.info(f"STEP 2 COMPLETE: Parallel processing finished in {time.time() - api_start_time:.2f} seconds.")
 
-        # ---------------------------------------------------------
-        # 5. AGGREGATE AND RETURN
-        # ---------------------------------------------------------
         logger.info("STEP 3: Aggregating chunked JSON arrays...")
         all_transactions = []
         
         for res in results:
-            if isinstance(res, list): # Only add if it didn't crash
+            if isinstance(res, list):
                 all_transactions.extend(res)
         
-        # Sort by date
         all_transactions.sort(key=lambda x: x.get("date", ""))
         
         logger.info(f"SUCCESS: Aggregated a total of {len(all_transactions)} transactions!")
